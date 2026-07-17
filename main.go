@@ -41,7 +41,7 @@ import (
 )
 
 const (
-	appVersion  = "v1.0.2"
+	appVersion  = "v1.0.3"
 	repoOwner   = "flexiy0"
 	repoName    = "sbox"
 	clashAPI    = "127.0.0.1:9095"
@@ -1270,6 +1270,27 @@ type tui struct {
 	msg     string
 	lines   int // сколько строк занял последний кадр
 	aliasOK bool
+	raw     *term.State // сохранённое состояние терминала (raw mode)
+}
+
+// enterRaw/exitRaw переключают терминал между сырым режимом (для перехвата
+// клавиш) и обычным (для ввода строк в редакторе настроек).
+func (t *tui) enterRaw() error {
+	st, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return err
+	}
+	t.raw = st
+	fmt.Print("\033[?25l") // скрыть курсор
+	return nil
+}
+
+func (t *tui) exitRaw() {
+	fmt.Print("\033[?25h" + clrReset) // показать курсор
+	if t.raw != nil {
+		term.Restore(int(os.Stdin.Fd()), t.raw)
+		t.raw = nil
+	}
 }
 
 func runTUI() error {
@@ -1291,15 +1312,10 @@ func runTUI() error {
 	}
 	t.call("test")
 
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
+	if err := t.enterRaw(); err != nil {
 		return fmt.Errorf("raw mode: %w", err)
 	}
-	fmt.Print("\033[?25l") // скрыть курсор
-	restore := func() {
-		fmt.Print("\033[?25h" + clrReset)
-		term.Restore(int(os.Stdin.Fd()), oldState)
-	}
+	restore := t.exitRaw
 	defer restore()
 
 	keys := make(chan byte, 16)
@@ -1357,6 +1373,12 @@ func runTUI() error {
 				t.render()
 				t.call("update")
 				t.msg = clrGreen + "subscription updated" + clrReset
+			case 'e', 'E':
+				t.editSettings(keys)
+			case '+', '=':
+				t.setLimit(1)
+			case '-', '_':
+				t.setLimit(-1)
 			case 'r', 'R':
 				t.call("toggle_rotate")
 			case 's', 'S':
@@ -1385,6 +1407,100 @@ func (t *tui) callArg(cmd, arg string) error {
 		return err
 	}
 	return t.dec.Decode(&t.status)
+}
+
+// setLimit меняет число показываемых лучших нод «на лету» (клавиши +/-).
+func (t *tui) setLimit(delta int) {
+	s := t.status.Settings
+	s.Limit += delta
+	if s.Limit < 1 {
+		s.Limit = 1
+	}
+	saveSettings(s)
+	t.call("reload")
+	t.msg = fmt.Sprintf("%sshowing best %d servers%s", clrGreen, s.Limit, clrReset)
+}
+
+// readLine — простой строковый редактор поверх канала клавиш (терминал
+// остаётся в raw-режиме, поэтому ввод отображаем вручную). Возвращает
+// (значение, true) по Enter или ("", false) по Esc/Ctrl-C.
+func (t *tui) readLine(keys chan byte, prompt, current string) (string, bool) {
+	buf := []rune(current)
+	redraw := func() { fmt.Printf("\r\033[K%s%s", prompt, string(buf)) }
+	redraw()
+	for b := range keys {
+		switch b {
+		case '\r', '\n':
+			fmt.Print("\r\n")
+			return strings.TrimSpace(string(buf)), true
+		case 0x1b, 0x03: // Esc / Ctrl-C — отмена
+			fmt.Print("\r\n")
+			return "", false
+		case 0x7f, 0x08: // Backspace
+			if len(buf) > 0 {
+				buf = buf[:len(buf)-1]
+			}
+		default:
+			if b >= 0x20 && b < 0x7f { // печатаемые ASCII
+				buf = append(buf, rune(b))
+			}
+		}
+		redraw()
+	}
+	return "", false
+}
+
+// editSettings — модальный редактор настроек прямо в интерфейсе: URL
+// подписки, тест-URL, число лучших и интервал ротации. Ничего вводить в
+// командной строке не нужно.
+func (t *tui) editSettings(keys chan byte) {
+	fmt.Print("\033[2J\033[H") // очистить экран под модалку
+	s := t.status.Settings
+	fmt.Print("\r\n" + clrBold + "  EDIT SETTINGS" + clrReset + "\r\n\r\n")
+	fmt.Printf("  [1] Subscription URL : %s\r\n", s.SubURL)
+	fmt.Printf("  [2] Test URL         : %s\r\n", s.TestURL)
+	fmt.Printf("  [3] Show best (N)    : %d\r\n", s.Limit)
+	fmt.Printf("  [4] Rotate interval  : %ds\r\n", s.RotateInterval)
+	fmt.Print("\r\n  " + clrDim + "Press 1-4 to edit, 0/Esc to cancel" + clrReset + "\r\n")
+
+	choice, ok := <-keys
+	if !ok {
+		return
+	}
+	changed, subChanged := false, false
+	switch choice {
+	case '1':
+		if v, ok := t.readLine(keys, "  Subscription URL: ", s.SubURL); ok && v != "" {
+			s.SubURL, changed, subChanged = v, true, true
+		}
+	case '2':
+		if v, ok := t.readLine(keys, "  Test URL: ", s.TestURL); ok && v != "" {
+			s.TestURL, changed = v, true
+		}
+	case '3':
+		if v, ok := t.readLine(keys, "  Show best (N): ", strconv.Itoa(s.Limit)); ok {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				s.Limit, changed = n, true
+			}
+		}
+	case '4':
+		if v, ok := t.readLine(keys, "  Rotate interval seconds: ", strconv.Itoa(s.RotateInterval)); ok {
+			if n, err := strconv.Atoi(v); err == nil && n >= 10 {
+				s.RotateInterval, changed = n, true
+			}
+		}
+	}
+	fmt.Print("\033[2J\033[H")
+	t.lines = 0
+	if changed {
+		saveSettings(s)
+		if subChanged {
+			t.msg = clrYellow + "applying new subscription..." + clrReset
+			t.render()
+		}
+		t.call("reload") // демон перечитает настройки (и перекачает подписку, если URL сменился)
+		t.msg = clrGreen + "settings saved" + clrReset
+	}
 }
 
 func latencyBar(ms int) string {
@@ -1483,7 +1599,8 @@ func (t *tui) render() {
 	if t.msg != "" {
 		w("%s", t.msg)
 	}
-	w("%s[ENTER] Apply | [U] Update Sub | [S] Self-Update | [R] Rotate On/Off | [D] Detach | [Up/Down] Navigate%s", clrDim, clrReset)
+	w("%s[ENTER] Apply | [E] Edit settings | [+/-] Show more/less | [U] Update Sub | [R] Rotate%s", clrDim, clrReset)
+	w("%s[S] Self-Update | [D] Detach | [Up/Down] Navigate%s", clrDim, clrReset)
 
 	frame := b.String()
 	t.lines = strings.Count(frame, "\r\n")
