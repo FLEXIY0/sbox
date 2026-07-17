@@ -158,12 +158,60 @@ func parseSubscription(raw string, limit int) []Node {
 		if err != nil {
 			continue
 		}
+		if err := validOutbound(n.outbound); err != nil {
+			// Битую ноду молча пропускаем: один невалидный outbound
+			// (пустой uuid, отсутствующий reality public_key и т.п.)
+			// заставляет sing-box отвергнуть ВЕСЬ конфиг и не стартовать.
+			logf("skipping node %d (%s): %v", n.ID, n.Type, err)
+			continue
+		}
+		n.ID = len(nodes) + 1
+		n.Tag = fmt.Sprintf("node-%02d", n.ID)
+		n.outbound["tag"] = n.Tag
 		nodes = append(nodes, n)
 		if len(nodes) >= limit {
 			break
 		}
 	}
 	return nodes
+}
+
+// validOutbound отбраковывает нежизнеспособные ноды до попадания в конфиг.
+// sing-box валидирует весь файл целиком при старте, поэтому одна битая
+// ссылка из бесплатного списка обрушивает запуск ядра.
+func validOutbound(ob map[string]any) error {
+	str := func(k string) string {
+		s, _ := ob[k].(string)
+		return s
+	}
+	if str("server") == "" {
+		return errors.New("empty server")
+	}
+	if p, _ := ob["server_port"].(int); p <= 0 || p > 65535 {
+		return fmt.Errorf("bad port %v", ob["server_port"])
+	}
+	switch ob["type"] {
+	case "vless", "vmess", "tuic":
+		if str("uuid") == "" {
+			return errors.New("empty uuid")
+		}
+	case "trojan", "hysteria2":
+		if str("password") == "" {
+			return errors.New("empty password")
+		}
+	case "shadowsocks":
+		if str("method") == "" || str("password") == "" {
+			return errors.New("empty method/password")
+		}
+	}
+	if tls, ok := ob["tls"].(map[string]any); ok {
+		if r, ok := tls["reality"].(map[string]any); ok {
+			if pk, _ := r["public_key"].(string); pk == "" {
+				return errors.New("reality without public_key")
+			}
+		}
+	}
+	return nil
 }
 
 func parseLink(link string, id int) (Node, error) {
@@ -480,9 +528,14 @@ func generateConfig(nodes []Node, s Settings) []byte {
 				map[string]any{"ip_is_private": true, "outbound": "direct"},
 				map[string]any{"rule_set": []any{"geoip-ru", "ru-bundle"}, "outbound": "direct"},
 			},
+			// download_detour: proxy — rule-set'ы лежат на GitHub, а GitHub у
+			// пользователя обычно и заблокирован (ради этого и нужен клиент).
+			// Качаем их ЧЕРЕЗ прокси, иначе sing-box не сможет получить их
+			// напрямую и роутер не поднимется. После первой загрузки они
+			// кэшируются в cache_file.
 			"rule_set": []any{
-				map[string]any{"type": "remote", "tag": "geoip-ru", "format": "binary", "url": geoipRuURL, "download_detour": "direct"},
-				map[string]any{"type": "remote", "tag": "ru-bundle", "format": "binary", "url": ruBundleURL, "download_detour": "direct"},
+				map[string]any{"type": "remote", "tag": "geoip-ru", "format": "binary", "url": geoipRuURL, "download_detour": "proxy"},
+				map[string]any{"type": "remote", "tag": "ru-bundle", "format": "binary", "url": ruBundleURL, "download_detour": "proxy"},
 			},
 			"final":                 "proxy",
 			"auto_detect_interface": true,
@@ -626,7 +679,18 @@ func (d *daemon) restartSingBox() error {
 	if err != nil {
 		return err
 	}
-	logFile, _ := os.OpenFile(filepath.Join(dataDir(), "sing-box.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	// Сначала валидируем конфиг самим sing-box — так реальная причина
+	// (битая нода, несовместимый формат) видна сразу, а не маскируется
+	// последующим «connection refused» к clash_api.
+	if out, cerr := exec.Command(bin, "check", "-c", configPath()).CombinedOutput(); cerr != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = cerr.Error()
+		}
+		return fmt.Errorf("sing-box rejected config: %s", firstLine(msg))
+	}
+	logPath := filepath.Join(dataDir(), "sing-box.log")
+	logFile, _ := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	cmd := exec.Command(bin, "run", "-c", configPath())
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -639,7 +703,46 @@ func (d *daemon) restartSingBox() error {
 	d.mu.Unlock()
 	go cmd.Wait()
 	logf("sing-box started (pid %d)", cmd.Process.Pid)
-	return nil
+
+	// Убеждаемся, что ядро действительно поднялось: даём немного времени и
+	// проверяем, что процесс не умер и clash_api отвечает. Иначе — вытаскиваем
+	// хвост его лога в статус, чтобы пользователь видел настоящую ошибку.
+	for i := 0; i < 12; i++ {
+		time.Sleep(400 * time.Millisecond)
+		if cmd.ProcessState != nil { // процесс уже завершился
+			return fmt.Errorf("sing-box exited on startup: %s", tailLog(logPath))
+		}
+		if resp, e := d.clashGet("/version"); e == nil {
+			resp.Body.Close()
+			return nil // ядро живо, API отвечает
+		}
+	}
+	if cmd.ProcessState != nil {
+		return fmt.Errorf("sing-box exited on startup: %s", tailLog(logPath))
+	}
+	return nil // процесс жив, но API ещё не ответил — не считаем ошибкой
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return s
+}
+
+// tailLog возвращает последние непустые строки лога sing-box для показа
+// пользователю (обрезаем ANSI/таймстампы не трогаем — важен смысл).
+func tailLog(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil || len(b) == 0 {
+		return "no log output (check " + path + ")"
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	from := len(lines) - 3
+	if from < 0 {
+		from = 0
+	}
+	return strings.TrimSpace(strings.Join(lines[from:], " | "))
 }
 
 func (d *daemon) stopSingBox() {
