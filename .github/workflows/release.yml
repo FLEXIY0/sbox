@@ -1,8 +1,12 @@
 name: release
 
+# Релиз создаётся при изменении файла VERSION (тег берётся из его содержимого)
+# или вручную через workflow_dispatch. Job сам создаёт git-тег и публикует
+# бинарники в GitHub Releases (permissions: contents: write).
 on:
   push:
-    tags: ["v*"]
+    branches: ["**"]
+    paths: ["VERSION"]
   workflow_dispatch:
     inputs:
       tag:
@@ -25,9 +29,15 @@ jobs:
         run: go test ./...
       - name: Cross-compile all platforms
         run: sh build.sh
-      - name: Upload release assets
+      - name: Determine release tag
+        id: ver
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          [ -n "$tag" ] || tag="$(cat VERSION)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Create release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ steps.ver.outputs.tag }}
           target_commitish: ${{ github.sha }}
           files: dist/*
