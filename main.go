@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	appVersion  = "v1.0.0"
+	appVersion  = "v1.0.1"
 	repoOwner   = "flexiy0"
 	repoName    = "sbox"
 	clashAPI    = "127.0.0.1:9095"
