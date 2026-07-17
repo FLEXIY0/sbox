@@ -22,7 +22,8 @@ build linux   arm   arm     7      # ARM 32-bit v7 (роутеры, Raspberry Pi
 build linux   mips  mips
 build linux   mipsle mipsle        # роутеры MIPS little-endian
 build linux   386   386
-build windows amd64 amd64
+build windows amd64 amd64          # Windows x86_64
+build windows 386   386            # Windows 32-bit (старые машины)
 build windows arm64 arm64          # Windows on ARM (Surface Pro X и т.п.)
 build darwin  amd64 amd64
 build darwin  arm64 arm64          # Apple Silicon
