@@ -8,12 +8,12 @@ MIPS), **Windows** и macOS — от слабого роутера до удал
 ```
 Subscription: https://raw.githubusercontent.com/.../subs.txt
 Test URL:     http://cp.cloudflare.com/generate_204
-Show limit:   15
+Show best:    15  (of 84 loaded, 84 tested)
 AUTO-ROTATE:  [ON] (60s interval)
 DAEMON:       [ACTIVE] (systemd)  |  SOURCE:  [LIVE / GITHUB]
-VERSION:      v1.0.0              |  ALIAS:   [s] INSTALLED
+VERSION:      v1.0.2              |  ALIAS:   [s] INSTALLED
 
------ SUBSCRIPTION STATUS (15 servers) --------------------------
+----- TOP 15 OF 84 SERVERS (sorted by latency) ------------------
       ID | TYPE                       | LATENCY
   ->  01 | REALITY-GERMANY            | [####.] 42ms  (* ACTIVE)
       02 | HYSTERIA2-FINLAND          | [###..] 65ms
@@ -85,8 +85,18 @@ irm https://raw.githubusercontent.com/flexiy0/sbox/main/install.ps1 | iex
 | `sbox --install-service` | автозапуск: systemd-юнит (Linux) / Task Scheduler (Windows) |
 | `sbox --update` | самообновление из GitHub Releases |
 | `sbox --sub URL` | сменить URL подписки |
+| `sbox --limit N` | сколько лучших серверов показывать (по пингу) |
+| `sbox --reset` | сбросить настройки/кэш и перенастроить с нуля |
 | `sbox --stop` | остановить демон |
 | `sbox --version` | версия и платформа |
+
+### Как это работает со списком серверов
+
+Демон загружает **все** ноды из подписки (до 200), тестирует каждую через
+clash_api и держит их отсортированными по задержке. В интерфейсе показываются
+только `N` лучших (`Show best`, по умолчанию 15) — число задаётся в мастере или
+на лету через `sbox --limit N`. Авто-ротация выбирает живую ноду с минимальным
+пингом из всего списка, а не только из показанных.
 
 ## Клавиши TUI
 

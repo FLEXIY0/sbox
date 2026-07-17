@@ -30,6 +30,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,7 +41,7 @@ import (
 )
 
 const (
-	appVersion  = "v1.0.1"
+	appVersion  = "v1.0.2"
 	repoOwner   = "flexiy0"
 	repoName    = "sbox"
 	clashAPI    = "127.0.0.1:9095"
@@ -82,7 +83,9 @@ type Node struct {
 type Status struct {
 	Version    string   `json:"version"`
 	Settings   Settings `json:"settings"`
-	Nodes      []Node   `json:"nodes"`
+	Nodes      []Node   `json:"nodes"` // топ-N по задержке (для показа)
+	TotalNodes int      `json:"total_nodes"`
+	Tested     int      `json:"tested"`
 	ActiveTag  string   `json:"active_tag"`
 	Source     string   `json:"source"` // LIVE / GITHUB | OFFLINE / LOCAL CACHE
 	Daemon     string   `json:"daemon"` // systemd | local | schtasks
@@ -91,8 +94,12 @@ type Status struct {
 	SingBoxRun bool     `json:"sing_box_running"`
 }
 
+// maxScanNodes — верхний предел числа нод, которые мы загружаем из подписки
+// и тестируем. Settings.Limit при этом задаёт лишь, сколько ЛУЧШИХ показать.
+const maxScanNodes = 200
+
 type ipcRequest struct {
-	Cmd string `json:"cmd"` // status | select | update | toggle_rotate | stop
+	Cmd string `json:"cmd"` // status | select | update | toggle_rotate | test | reload | stop
 	Arg string `json:"arg,omitempty"`
 }
 
@@ -127,6 +134,23 @@ func saveSettings(s Settings) error {
 	}
 	b, _ := json.MarshalIndent(s, "", "  ")
 	return os.WriteFile(settingsPath(), b, 0o644)
+}
+
+// resetAll останавливает демон и удаляет настройки, кэш подписки и конфиг —
+// следующий запуск `sbox` заново проходит мастер настройки.
+func resetAll() error {
+	if conn, err := dialIPC(dataDir()); err == nil {
+		json.NewEncoder(conn).Encode(ipcRequest{Cmd: "stop"})
+		conn.Close()
+		time.Sleep(500 * time.Millisecond)
+	}
+	for _, p := range []string{
+		settingsPath(), cachePath(), configPath(),
+		filepath.Join(dataDir(), "cache.db"),
+	} {
+		os.Remove(p)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -657,10 +681,13 @@ func (d *daemon) refresh() error {
 		logf("subscription download failed (%v), using local cache", err)
 	}
 
-	nodes := parseSubscription(raw, s.Limit)
+	// Грузим ВСЕ ноды подписки (до maxScanNodes) — тестируются потом все,
+	// а Settings.Limit определяет лишь, сколько лучших показать в TUI.
+	nodes := parseSubscription(raw, maxScanNodes)
 	if len(nodes) == 0 {
 		return errors.New("subscription contains no supported links")
 	}
+	logf("loaded %d nodes from subscription", len(nodes))
 	cfg := generateConfig(nodes, s)
 	if err := os.WriteFile(configPath(), cfg, 0o644); err != nil {
 		return err
@@ -813,7 +840,7 @@ func (d *daemon) testAll() {
 	testURL := d.settings.TestURL
 	d.mu.Unlock()
 
-	sem := make(chan struct{}, 8)
+	sem := make(chan struct{}, 16)
 	var wg sync.WaitGroup
 	results := make([]int, len(nodes))
 	for i, n := range nodes {
@@ -838,12 +865,40 @@ func (d *daemon) testAll() {
 
 func (d *daemon) testLoop() {
 	time.Sleep(3 * time.Second) // дать sing-box подняться
+	first := true
 	for {
 		if d.singBoxRunning() {
 			d.testAll()
+			// После первого прогона встаём на лучшую живую ноду, чтобы не
+			// сидеть на произвольной node-01, которая могла оказаться мёртвой.
+			if first {
+				d.mu.Lock()
+				auto := d.settings.AutoRotate
+				d.mu.Unlock()
+				if auto {
+					if best := d.bestNode(""); best != "" {
+						d.selectNode(best)
+					}
+				}
+				first = false
+			}
 		}
-		time.Sleep(60 * time.Second)
+		time.Sleep(30 * time.Second)
 	}
+}
+
+// bestNode возвращает тег живой ноды с минимальным пингом (кроме exclude).
+func (d *daemon) bestNode(exclude string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	best := ""
+	bestLat := 1 << 30
+	for _, n := range d.nodes {
+		if n.Latency > 0 && n.Latency < bestLat && n.Tag != exclude {
+			best, bestLat = n.Tag, n.Latency
+		}
+	}
+	return best
 }
 
 func (d *daemon) rotateLoop() {
@@ -869,16 +924,7 @@ func (d *daemon) rotateLoop() {
 		}
 		logf("active node %s is DEAD, rotating", active)
 		d.testAll()
-		d.mu.Lock()
-		best := ""
-		bestLat := 1 << 30
-		for _, n := range d.nodes {
-			if n.Latency > 0 && n.Latency < bestLat && n.Tag != active {
-				best, bestLat = n.Tag, n.Latency
-			}
-		}
-		d.mu.Unlock()
-		if best != "" {
+		if best := d.bestNode(active); best != "" {
 			d.selectNode(best)
 		}
 	}
@@ -889,16 +935,22 @@ func (d *daemon) rotateLoop() {
 func (d *daemon) status() Status {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	st := Status{
-		Version:   appVersion,
-		Settings:  d.settings,
-		Nodes:     append([]Node(nil), d.nodes...),
-		ActiveTag: d.active,
-		Source:    d.source,
-		Daemon:    serviceKind(),
-		LastError: d.lastErr,
+
+	// Сортируем копию по задержке: сначала живые (по возрастанию пинга),
+	// затем ещё не протестированные, в конце — мёртвые. Показываем топ-Limit.
+	sorted := append([]Node(nil), d.nodes...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return latencyRank(sorted[i].Latency) < latencyRank(sorted[j].Latency)
+	})
+	limit := d.settings.Limit
+	if limit <= 0 {
+		limit = 15
 	}
-	st.SingBoxRun = d.proc != nil && d.proc.ProcessState == nil
+	shown := sorted
+	if len(shown) > limit {
+		shown = shown[:limit]
+	}
+
 	tested, alive := 0, 0
 	for _, n := range d.nodes {
 		if n.Latency != -1 {
@@ -908,8 +960,33 @@ func (d *daemon) status() Status {
 			alive++
 		}
 	}
+	st := Status{
+		Version:    appVersion,
+		Settings:   d.settings,
+		Nodes:      shown,
+		TotalNodes: len(d.nodes),
+		Tested:     tested,
+		ActiveTag:  d.active,
+		Source:     d.source,
+		Daemon:     serviceKind(),
+		LastError:  d.lastErr,
+	}
+	st.SingBoxRun = d.proc != nil && d.proc.ProcessState == nil
 	st.AllDead = len(d.nodes) > 0 && tested == len(d.nodes) && alive == 0
 	return st
+}
+
+// latencyRank задаёт порядок сортировки: живые ноды (по пингу) < не
+// протестированные (-1) < мёртвые (<=0). Возвращает ключ для сравнения.
+func latencyRank(ms int) int {
+	switch {
+	case ms > 0:
+		return ms // живые: чем меньше пинг, тем выше
+	case ms == -1:
+		return 1 << 20 // ещё не тестировались
+	default:
+		return 1 << 21 // DEAD — в самый низ
+	}
 }
 
 func (d *daemon) serveConn(conn net.Conn) {
@@ -939,6 +1016,21 @@ func (d *daemon) serveConn(conn net.Conn) {
 			saveSettings(s)
 		case "test":
 			go d.testAll()
+		case "reload":
+			// Перечитываем настройки с диска. Если сменился URL подписки —
+			// перекачиваем и перезапускаем ядро; иначе меняется только показ.
+			if ns, err := loadSettings(); err == nil {
+				d.mu.Lock()
+				subChanged := ns.SubURL != d.settings.SubURL
+				d.settings = ns
+				d.mu.Unlock()
+				if subChanged {
+					if err := d.refresh(); err != nil {
+						d.setErr(err)
+					}
+					go func() { time.Sleep(3 * time.Second); d.testAll() }()
+				}
+			}
 		case "stop":
 			enc.Encode(d.status())
 			d.stopSingBox()
@@ -1345,7 +1437,7 @@ func (t *tui) render() {
 	}
 	w("%sSubscription:%s %s", clrBold, clrReset, sub)
 	w("%sTest URL:%s     %s", clrBold, clrReset, st.Settings.TestURL)
-	w("%sShow limit:%s   %d", clrBold, clrReset, st.Settings.Limit)
+	w("%sShow best:%s    %d  (of %d loaded, %d tested)", clrBold, clrReset, st.Settings.Limit, st.TotalNodes, st.Tested)
 	w("%sAUTO-ROTATE:%s  %s (%ds interval)", clrBold, clrReset,
 		onOff(st.Settings.AutoRotate, "[ON]", "[OFF]"), st.Settings.RotateInterval)
 	daemonLbl := "[LOCAL / NO " + strings.ToUpper(serviceManagerName()) + "]"
@@ -1365,7 +1457,7 @@ func (t *tui) render() {
 	}
 	w("%sVERSION:%s      %s  |  %sALIAS:%s   %s", clrBold, clrReset, st.Version, clrBold, clrReset, alias)
 	w("")
-	w("%s----- SUBSCRIPTION STATUS (%d servers) --------------------------%s", clrDim, len(st.Nodes), clrReset)
+	w("%s----- TOP %d OF %d SERVERS (sorted by latency) ------------------%s", clrDim, len(st.Nodes), st.TotalNodes, clrReset)
 	w("      ID | %-26s | LATENCY", "TYPE")
 	for i, n := range st.Nodes {
 		ptr := "  "
@@ -1419,7 +1511,7 @@ func firstRunWizard() error {
 	if line, _ = rd.ReadString('\n'); strings.TrimSpace(line) != "" {
 		s.TestURL = strings.TrimSpace(line)
 	}
-	fmt.Printf("Node display limit [%d]:\n> ", s.Limit)
+	fmt.Printf("How many BEST servers to show (all are scanned & tested) [%d]:\n> ", s.Limit)
 	if line, _ = rd.ReadString('\n'); strings.TrimSpace(line) != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && n > 0 {
 			s.Limit = n
@@ -1487,12 +1579,27 @@ func main() {
 	installSvc := flag.Bool("install-service", false, "install background service ("+serviceManagerName()+") and exit")
 	stopFlag := flag.Bool("stop", false, "stop the running daemon and exit")
 	subURL := flag.String("sub", "", "set subscription URL and exit")
+	limitFlag := flag.Int("limit", 0, "set how many best servers to show and exit")
+	resetFlag := flag.Bool("reset", false, "wipe settings, cache and config, stop daemon, then reconfigure on next run")
 	showVer := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
 	switch {
 	case *showVer:
 		fmt.Println("sbox", appVersion, runtime.GOOS+"/"+runtime.GOARCH)
+	case *resetFlag:
+		fatal(resetAll())
+		fmt.Println("reset done — run `sbox` (or `s`) to reconfigure from scratch")
+	case *limitFlag > 0:
+		s, _ := loadSettings()
+		s.Limit = *limitFlag
+		fatal(saveSettings(s))
+		// Если демон запущен — попросим переприменить настройки на лету.
+		if conn, err := dialIPC(dataDir()); err == nil {
+			json.NewEncoder(conn).Encode(ipcRequest{Cmd: "reload"})
+			conn.Close()
+		}
+		fmt.Printf("now showing best %d servers\n", *limitFlag)
 	case *update:
 		res, err := selfUpdate()
 		fatal(err)
